@@ -1,0 +1,18 @@
+# Generated CCF / peak-lag / clock-estimate outputs
+data/
+
+# Run logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local editor / OS
+.vscode/
+.idea/
+.DS_Store

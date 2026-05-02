@@ -46,18 +46,17 @@ DEFAULT_PAIRS = ("HYS12-HYS14", "HYS14-HYSB1", "HYS12-HYSB1")
 
 # ---- Acquisition / preprocessing (8 Hz native) ----
 TARGET_FS = 8.0
-HP_FREQ = 0.4
 GAP_TAPER_S = 100.0
-# pre_filt is clamped to Nyquist (~4 Hz) per-trace at runtime.
-PRE_FILT = (0.05, 0.1, 3.6, 3.95)
 
-# ---- CC / whitening ----
-FMIN, FMAX = 1.0, 3.0          # science band
+# These can be overridden from CLI; module globals are mutated in main().
+HP_FREQ = 0.4
+PRE_FILT = (0.05, 0.1, 3.6, 3.95)  # response-removal corners
+FMIN, FMAX = 1.0, 3.0              # science band (informational)
 WHITEN_FMIN, WHITEN_FMAX = 0.5, 3.8
 SEG_TAPER_S = 20.0
-CC_LEN = 1800                  # 30-min windows
-CC_STEP = 450                  # 7.5-min step => 75% overlap
-MAXLAG = 60.0                  # seconds
+CC_LEN = 1800                      # 30-min windows
+CC_STEP = 450                      # 7.5-min step => 75% overlap
+MAXLAG = 60.0                      # seconds
 
 LOG = logging.getLogger("hys_ccf")
 
@@ -262,8 +261,9 @@ def _process_one_day(args):
     return d, np.asarray(cc_list, dtype=np.float32), np.asarray(t_list, dtype=np.float64)
 
 
-def run_pair(pair: Pair, start: date, end: date, workers: int) -> None:
-    out_dir = OUT_ROOT / pair.tag
+def run_pair(pair: Pair, start: date, end: date, workers: int, tag: str = "") -> None:
+    out_name = f"{pair.tag}_{tag}" if tag else pair.tag
+    out_dir = OUT_ROOT / out_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     days = []
@@ -338,20 +338,43 @@ def parse_pair(s: str) -> Pair:
 
 
 def main() -> int:
+    global HP_FREQ, PRE_FILT, FMIN, FMAX, WHITEN_FMIN, WHITEN_FMAX, MAXLAG
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--pairs", nargs="+", default=list(DEFAULT_PAIRS))
     p.add_argument("--start", type=parse_date, default=date(2022, 1, 1))
     p.add_argument("--end", type=parse_date, default=date.today())
     p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--tag", default="",
+                   help="Output suffix; outputs land in data/ccf/<pair>_<tag>/.")
+    p.add_argument("--fmin", type=float, default=FMIN)
+    p.add_argument("--fmax", type=float, default=FMAX)
+    p.add_argument("--whiten-fmin", type=float, default=WHITEN_FMIN)
+    p.add_argument("--whiten-fmax", type=float, default=WHITEN_FMAX)
+    p.add_argument("--hp-freq", type=float, default=HP_FREQ,
+                   help="Pre-filter high-pass cutoff before response removal.")
+    p.add_argument("--pre-filt", nargs=4, type=float, default=list(PRE_FILT),
+                   metavar=("F1", "F2", "F3", "F4"),
+                   help="remove_response pre_filt corners (Hz).")
+    p.add_argument("--maxlag", type=float, default=MAXLAG)
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
+
+    HP_FREQ = args.hp_freq
+    PRE_FILT = tuple(args.pre_filt)
+    FMIN, FMAX = args.fmin, args.fmax
+    WHITEN_FMIN, WHITEN_FMAX = args.whiten_fmin, args.whiten_fmax
+    MAXLAG = args.maxlag
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    LOG.info(
+        "params: hp=%.3f prefilt=%s science=%.3f-%.3f whiten=%.3f-%.3f maxlag=%g tag=%r",
+        HP_FREQ, PRE_FILT, FMIN, FMAX, WHITEN_FMIN, WHITEN_FMAX, MAXLAG, args.tag,
+    )
     for pair_str in args.pairs:
-        run_pair(parse_pair(pair_str), args.start, args.end, args.workers)
+        run_pair(parse_pair(pair_str), args.start, args.end, args.workers, args.tag)
     return 0
 
 
