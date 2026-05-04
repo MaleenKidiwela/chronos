@@ -1,9 +1,8 @@
 #!/usr/bin/env python
-"""Daily inter-station ZZ cross-correlations for OO.HYS{12,14,B1}.MHZ.
+"""Daily inter-station ZZ cross-correlations for any pair, channel, network.
 
-Adapted from Earthnote's `phase13_pilot.py` (single-station SC) to inter-station
-ZZ pairs at 8 Hz native sample rate, science band 1-3 Hz. Hand-rolled CCF: bare
-ObsPy + numpy + scipy, no NoisePy dependency in the package itself.
+Hand-rolled CCF (bare ObsPy + numpy + scipy, no NoisePy dependency)
+operating on station pairs identified by a tag like `STA_A-STA_B`.
 
 Per-pair outputs under data/ccf/<pair_tag>/:
     cc_30min.npy          shape (N_segs, n_lags)
@@ -13,11 +12,12 @@ Per-pair outputs under data/ccf/<pair_tag>/:
     cc_ref.npy            long-term linear stack reference
     lags.npy              lag axis in seconds, shape (n_lags,)
 
-Usage:
-    python hys_ccf.py                            # 2022-01-01 .. today, all 3 pairs
-    python hys_ccf.py --start 2022-01-01 --end 2022-12-31
-    python hys_ccf.py --pairs HYS12-HYS14 HYS14-HYSB1
-    python hys_ccf.py --workers 8
+Usage examples:
+    python -m chronos.scripts.compute_ccf --pairs HYS12-HYS14 --workers 8
+    python -m chronos.scripts.compute_ccf --pairs A-B \
+        --network OO --channel MHZ \
+        --fmin 0.1 --fmax 0.3 --whiten-fmin 0.05 --whiten-fmax 0.4 \
+        --hp-freq 0.04 --pre-filt 0.02 0.04 3.6 3.95 --tag lowband
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ OUT_ROOT = CHRONOS_ROOT / "data" / "ccf"
 
 NETWORK = "OO"
 CHANNEL = "MHZ"
-DEFAULT_PAIRS = ("HYS12-HYS14", "HYS14-HYSB1", "HYS12-HYSB1")
+DEFAULT_PAIRS: tuple[str, ...] = ()  # require explicit --pairs
 
 # ---- Acquisition / preprocessing (8 Hz native) ----
 TARGET_FS = 8.0
@@ -351,8 +351,16 @@ def parse_pair(s: str) -> Pair:
 
 def main() -> int:
     global HP_FREQ, PRE_FILT, FMIN, FMAX, WHITEN_FMIN, WHITEN_FMAX, MAXLAG
+    global NETWORK, CHANNEL, DATA_ROOT
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--pairs", nargs="+", default=list(DEFAULT_PAIRS))
+    p.add_argument("--pairs", nargs="+", required=True,
+                   help="Pair tags A-B, e.g. HYS12-HYS14. Repeatable.")
+    p.add_argument("--network", default=NETWORK,
+                   help=f"Network code (default: {NETWORK})")
+    p.add_argument("--channel", default=CHANNEL,
+                   help=f"Channel code (default: {CHANNEL})")
+    p.add_argument("--data-root", default=str(DATA_ROOT),
+                   help=f"Raw MiniSEED root (default: {DATA_ROOT})")
     p.add_argument("--start", type=parse_date, default=date(2022, 1, 1))
     p.add_argument("--end", type=parse_date, default=date.today())
     p.add_argument("--workers", type=int, default=1)
@@ -382,6 +390,9 @@ def main() -> int:
         sta, path = override.split("=", 1)
         DATA_ROOT_OVERRIDES[sta.strip()] = Path(path.strip())
 
+    NETWORK = args.network
+    CHANNEL = args.channel
+    DATA_ROOT = Path(args.data_root)
     HP_FREQ = args.hp_freq
     PRE_FILT = tuple(args.pre_filt)
     FMIN, FMAX = args.fmin, args.fmax

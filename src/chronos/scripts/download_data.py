@@ -1,20 +1,17 @@
 #!/usr/bin/env python
-"""Download MHZ (8 Hz) data for OO.HYS{12,14,B1} from EarthScope FDSN.
+"""Download daily MiniSEED + StationXML for any stations from FDSN.
 
-Saves per-day MiniSEED files into the layout the Julia Plot_correlation.ipynb
-notebook reads from:
-
-    /data/wsd02/maleen_data/OOI-Data/{sta}/{yr}/{doy:03d}/{sta}.OO.{yr}.{doy:03d}.MHZ
-    /data/wsd02/maleen_data/OOI-Data/StationXML/OO.{sta}..MHZ.xml
+Saves per-day files into a per-station tree:
+    <data-root>/<sta>/<yr>/<doy:03d>/<sta>.<network>.<yr>.<doy:03d>.<channel>
+    <data-root>/StationXML/<network>.<sta>..<channel>.xml
 
 Idempotent: skips files that already exist on disk. Logs gaps/errors per day
 so a re-run only fetches what is missing.
 
 Usage:
-    python download_hys.py                       # 2022-01-01 .. today, all 3 stations
-    python download_hys.py --start 2022-01-01 --end 2022-12-31
-    python download_hys.py --stations HYS14
-    python download_hys.py --workers 4           # parallel days per station
+    python -m chronos.scripts.download_data \
+        --network OO --stations HYS12 HYS14 --channel MHZ \
+        --start 2022-01-01 --workers 4
 """
 from __future__ import annotations
 
@@ -29,13 +26,13 @@ from obspy import UTCDateTime
 from obspy.clients.fdsn import Client
 from obspy.clients.fdsn.header import FDSNNoDataException
 
+# Module-level state set from CLI args; functions reference these.
 NETWORK = "OO"
 CHANNEL = "MHZ"
-LOCATION = "*"  # OOI uses various location codes; let the server resolve
-STATIONS_DEFAULT = ("HYS12", "HYS14", "HYSB1")
+LOCATION = "*"
 DATA_ROOT = Path("/data/wsd02/maleen_data/OOI-Data")
 
-LOG = logging.getLogger("download_hys")
+LOG = logging.getLogger("download_data")
 
 
 def daily_path(sta: str, d: date) -> Path:
@@ -144,13 +141,28 @@ def parse_date(s: str) -> date:
 
 
 def main() -> int:
+    global NETWORK, CHANNEL, LOCATION, DATA_ROOT
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--stations", nargs="+", default=list(STATIONS_DEFAULT))
+    p.add_argument("--stations", nargs="+", required=True,
+                   help="Station codes, e.g. HYS12 HYS14 HYSB1.")
+    p.add_argument("--network", required=True,
+                   help="Network code, e.g. OO.")
+    p.add_argument("--channel", required=True,
+                   help="Channel code, e.g. MHZ.")
+    p.add_argument("--location", default="*",
+                   help="Location code (default: * — let the server resolve).")
+    p.add_argument("--data-root", default=str(DATA_ROOT),
+                   help=f"Root directory for output tree (default: {DATA_ROOT}).")
     p.add_argument("--start", type=parse_date, default=date(2022, 1, 1))
     p.add_argument("--end", type=parse_date, default=date.today())
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
+
+    NETWORK = args.network
+    CHANNEL = args.channel
+    LOCATION = args.location
+    DATA_ROOT = Path(args.data_root)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

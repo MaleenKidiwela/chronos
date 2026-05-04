@@ -1,0 +1,2 @@
+[console_scripts]
+chronfix-apply = chronfix.scripts.apply_correction:main

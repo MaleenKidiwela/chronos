@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Filter hourly Δt and detect threshold-triggered intervals.
 
-Replaces the previous (mark_sudden_changes + clean_within_segments + find_resyncs)
-workflow with a single multi-pass Hampel-style filter followed by interval
-trigger detection on the differences between consecutive retained points.
+A single multi-pass Hampel-style filter followed by interval trigger
+detection on the differences between consecutive retained points. This
+is the chronos→chronfix bridge: it consumes the hourly Δt produced by
+combine_clock and produces the correction file chronfix consumes.
 
 Workflow:
-    1. Load dt_hourly_from_HYS12_HYS14.npy (chronos primary, sign-flipped Δt).
+    1. Load primary Δt (sign-flipped to target's clock) from a per-pair
+       file like dt_hourly_from_<primary-pair>.npy. Default: derived
+       from --target and --primary-pair.
     2. Apply final outlier filter:
        - 3-pass Hampel filter (windows 168 / 72 / 25 hours)
        - 3-point continuity residual pass
@@ -16,17 +19,20 @@ Workflow:
     4. Trigger when |Δdt_k| > threshold (default 1.0 s).
     5. Trigger interval is [t(k-1), t(k)]; merge overlapping intervals.
     6. Save:
-       - filtered .npy
+       - filtered .npy           (delta_t_hourly_clean.npy)
        - outlier mask .npy
-       - trigger-period CSV
+       - trigger-period CSV       (trigger_periods.csv)
        - full-time trigger plot
 
-Run from `/home/seismic/chronos`:
+Run from anywhere:
 
-    python -m chronfix.scripts.filter_and_triggers
+    python -m chronos.scripts.filter_and_triggers --target HYS14 \
+        --primary-pair HYS12-HYS14
 """
 from __future__ import annotations
 
+import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -35,26 +41,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-# ============================================================
-# Paths and parameters
-# ============================================================
-
-CLOCK_DIR = Path("/home/seismic/chronos/data/clock_estimate/HYS14")
-
-INPUT_FILE = CLOCK_DIR / "dt_hourly_from_HYS12_HYS14.npy"
-
-# Hourly data: convert sample index to elapsed days
-SAMPLES_PER_DAY = 24.0
-
-# Trigger threshold (seconds of |Δdt| between consecutive retained points)
-TRIGGER_THRESHOLD = 1.0
-
-# Plot/output names
-FILTERED_NPY = CLOCK_DIR / "delta_t_hourly_clean.npy"
-OUTLIER_MASK_NPY = CLOCK_DIR / "delta_t_hourly_outlier_mask.npy"
-TRIGGER_CSV = CLOCK_DIR / "trigger_periods.csv"
-PLOT_FILE = CLOCK_DIR / "filter_and_triggers.png"
+DEFAULT_CHRONOS_ROOT = Path("/home/seismic/chronos")
+SAMPLES_PER_DAY = 24.0  # one Δt sample per hour
+DEFAULT_TRIGGER_THRESHOLD = 1.0  # |Δdt| (s) between consecutive retained points
 
 
 # ============================================================
@@ -278,30 +267,60 @@ def plot_filtered_and_triggers(
 # ============================================================
 
 def main():
-    dt_orig = np.load(INPUT_FILE).astype(float)
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--target", required=True,
+                   help="Station whose clock is being corrected (e.g. HYS14).")
+    p.add_argument("--primary-pair", required=True,
+                   help="Pair tag whose Δt was sign-flipped to target. "
+                        "Reads dt_hourly_from_<primary-pair>.npy.")
+    p.add_argument("--chronos-root", default=str(DEFAULT_CHRONOS_ROOT))
+    p.add_argument("--input-file", default=None,
+                   help="Override input Δt npy. Default: "
+                        "<chronos-root>/data/clock_estimate/<target>/dt_hourly_from_<primary-pair>.npy")
+    p.add_argument("--clock-dir", default=None,
+                   help="Override output directory. Default: "
+                        "<chronos-root>/data/clock_estimate/<target>/")
+    p.add_argument("--threshold", type=float, default=DEFAULT_TRIGGER_THRESHOLD,
+                   help="|Δdt| threshold between consecutive retained hourly samples (s).")
+    args = p.parse_args()
+
+    clock_dir = Path(args.clock_dir) if args.clock_dir else (
+        Path(args.chronos_root) / "data" / "clock_estimate" / args.target
+    )
+    input_file = Path(args.input_file) if args.input_file else (
+        clock_dir / f"dt_hourly_from_{args.primary_pair}.npy"
+    )
+
+    filtered_npy = clock_dir / "delta_t_hourly_clean.npy"
+    outlier_mask_npy = clock_dir / "delta_t_hourly_outlier_mask.npy"
+    trigger_csv = clock_dir / "trigger_periods.csv"
+    plot_file = clock_dir / "filter_and_triggers.png"
+
+    clock_dir.mkdir(parents=True, exist_ok=True)
+    dt_orig = np.load(input_file).astype(float)
 
     dt_clean, final_mask, strict_mask, extra_mask = apply_final_filter(dt_orig)
 
     periods, valid_t, valid_dt, diff_ignore_nans, raw_intervals = compute_trigger_periods(
-        dt_clean, threshold=TRIGGER_THRESHOLD, samples_per_day=SAMPLES_PER_DAY,
+        dt_clean, threshold=args.threshold, samples_per_day=SAMPLES_PER_DAY,
     )
 
-    np.save(FILTERED_NPY, dt_clean)
-    np.save(OUTLIER_MASK_NPY, final_mask)
-    periods.to_csv(TRIGGER_CSV, index=False)
+    np.save(filtered_npy, dt_clean)
+    np.save(outlier_mask_npy, final_mask)
+    periods.to_csv(trigger_csv, index=False)
 
     plot_filtered_and_triggers(
         dt_clean, periods, valid_t, diff_ignore_nans,
-        threshold=TRIGGER_THRESHOLD, samples_per_day=SAMPLES_PER_DAY,
-        outfile=PLOT_FILE,
+        threshold=args.threshold, samples_per_day=SAMPLES_PER_DAY,
+        outfile=plot_file,
     )
 
     orig_finite = np.isfinite(dt_orig)
     clean_finite = np.isfinite(dt_clean)
 
-    print("Final filter summary")
-    print("--------------------")
-    print(f"Input file: {INPUT_FILE}")
+    print(f"Final filter summary  (target={args.target}, primary={args.primary_pair})")
+    print("-" * 60)
+    print(f"Input file: {input_file}")
     print(f"Original samples: {len(dt_orig)}")
     print(f"Original finite samples: {orig_finite.sum()}")
     print(f"Strict-stage removed: {strict_mask.sum()}")
@@ -311,8 +330,8 @@ def main():
     print()
 
     print("Trigger summary")
-    print("---------------")
-    print(f"Threshold: |Δdt| > {TRIGGER_THRESHOLD}")
+    print("-" * 15)
+    print(f"Threshold: |Δdt| > {args.threshold}")
     print(f"Triggered pair-intervals before merging: {len(raw_intervals)}")
     print(f"Shaded periods after merging: {len(periods)}")
     print()
@@ -325,13 +344,15 @@ def main():
         }).to_string(index=False))
         print()
 
-    print("Saved outputs")
-    print("-------------")
-    print(f"Filtered data: {FILTERED_NPY}")
-    print(f"Outlier mask:  {OUTLIER_MASK_NPY}")
-    print(f"Trigger CSV:   {TRIGGER_CSV}")
-    print(f"Trigger plot:  {PLOT_FILE}")
+    print("Saved outputs (this is the correction file chronfix consumes)")
+    print("-" * 60)
+    print(f"Filtered data: {filtered_npy}")
+    print(f"Outlier mask:  {outlier_mask_npy}")
+    print(f"Trigger CSV:   {trigger_csv}")
+    print(f"Trigger plot:  {plot_file}")
+    print()
+    print("Pass --correction-dir", clock_dir, "to chronfix.scripts.apply_correction.")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

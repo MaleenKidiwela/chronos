@@ -1,0 +1,92 @@
+# chronfix
+
+Apply chronos-measured timing corrections to MiniSEED data.
+
+chronos measures the clock error Δt(t) of one station against a
+reference station and writes a **correction file** (a directory of
+NumPy arrays + CSV). chronfix consumes that correction file and
+produces corrected MiniSEED, splitting the output at every trigger
+boundary (real clock discontinuity).
+
+This package does *not* depend on chronos at runtime — it just reads
+the correction file format. The two are kept separate so chronfix can
+be released as its own repository.
+
+## Install
+
+```bash
+pip install -e .
+```
+
+## Usage
+
+```bash
+python -m chronfix.scripts.apply_correction \
+    --correction-dir /home/seismic/chronos/data/clock_estimate/HYS14 \
+    --network OO --station HYS14 --channel MHZ \
+    --input-root  /data/wsd02/maleen_data/OOI-Data \
+    --output-root /data/wsd02/maleen_data/OOI-Data-corrected \
+    --start 2022-01-01 --workers 8
+```
+
+Outputs:
+- One MiniSEED file per input day under
+  `<output-root>/<station>/<yr>/<doy>/<station>.<network>.<yr>.<doy>.<channel>`,
+  containing one record per stable segment overlap.
+- A `<output-root>/<station>/manifest.csv` with one row per output
+  segment (input path, output path, UTC bounds, sample count).
+
+## Correction-file format
+
+The correction directory must contain:
+
+| File | dtype | meaning |
+|---|---|---|
+| `delta_t_hourly_clean.npy` | float64 | Cleaned hourly Δt (s); NaN where masked |
+| `hour_times.npy` | datetime64[h] | Master hour axis aligned with `delta_t_hourly_clean` |
+| `trigger_periods.csv` | — | Merged trigger intervals; needs `start_index`, `end_index` |
+
+This is exactly what `chronos.scripts.filter_and_triggers` writes.
+
+## Public API
+
+```python
+from chronfix import ClockModel, correct_trace, correct_stream
+
+model = ClockModel.from_chronos("/path/to/clock_estimate/HYS14")
+corrected_traces = correct_trace(tr, model, method="resample")  # list[Trace]
+corrected_stream = correct_stream(st, model, method="resample") # Stream
+```
+
+`method="resample"` (default) interpolates the trace data onto a
+regular UTC grid. `method="shift_only"` is bit-identical-data lossless
+but only valid when within-segment drift is negligible.
+
+## Layout
+
+```
+chronfix/
+├── README.md
+├── pyproject.toml
+├── DESIGN.md
+├── src/chronfix/
+│   ├── __init__.py
+│   ├── clock_model.py    ClockModel: load + query the correction file
+│   ├── correct.py        correct_trace / correct_stream
+│   └── scripts/
+│       └── apply_correction.py    CLI driver
+└── tests/
+```
+
+## Across-trigger gaps and overlaps
+
+A trigger interval is a real clock discontinuity. After correction:
+
+- Δt **decreasing** at the trigger → corrected output has a UTC **gap**
+  between the two segment files equal to the jump magnitude.
+- Δt **increasing** at the trigger → corrected output has a UTC
+  **overlap**.
+
+These reflect the fact that the clock was wrong before the trigger and
+the discontinuity is unavoidable. Downstream tools must handle both as
+they would any other gap or duplicate.

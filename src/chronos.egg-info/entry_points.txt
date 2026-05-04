@@ -1,0 +1,6 @@
+[console_scripts]
+chronos-combine-clock = chronos.scripts.combine_clock:main
+chronos-compute-ccf = chronos.scripts.compute_ccf:main
+chronos-download = chronos.scripts.download_data:main
+chronos-filter = chronos.scripts.filter_and_triggers:main
+chronos-peak-lag = chronos.scripts.compute_peak_lag:main
