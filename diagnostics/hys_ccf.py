@@ -31,7 +31,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
-from obspy import read, read_inventory
+from obspy import read, read_inventory, UTCDateTime
 
 warnings.filterwarnings("ignore")
 
@@ -93,9 +93,13 @@ def taper_gaps(tr, taper_s: float = GAP_TAPER_S) -> None:
     tr.data = data
 
 
+DATA_ROOT_OVERRIDES: dict[str, Path] = {}
+
+
 def daily_path(sta: str, d: date) -> Path:
     doy = d.timetuple().tm_yday
-    return DATA_ROOT / sta / f"{d.year}" / f"{doy:03d}" / f"{sta}.{NETWORK}.{d.year}.{doy:03d}.{CHANNEL}"
+    root = DATA_ROOT_OVERRIDES.get(sta, DATA_ROOT)
+    return root / sta / f"{d.year}" / f"{doy:03d}" / f"{sta}.{NETWORK}.{d.year}.{doy:03d}.{CHANNEL}"
 
 
 def load_day_z(sta: str, d: date, inv) -> np.ndarray | None:
@@ -141,6 +145,14 @@ def load_day_z(sta: str, d: date, inv) -> np.ndarray | None:
             tr.resample(TARGET_FS, no_filter=False)
         else:
             tr.interpolate(sampling_rate=TARGET_FS, method="lanczos", a=20)
+
+    # Force the trace to span exactly the canonical UTC day so sample 0 of
+    # different stations always corresponds to the same UTC second.
+    # Important when reading chronfix-corrected files whose starttime is
+    # offset by -Δt from midnight.
+    day_start = UTCDateTime(d.year, d.month, d.day)
+    tr.trim(starttime=day_start, endtime=day_start + 86400.0,
+            pad=True, fill_value=0.0, nearest_sample=True)
 
     return np.asarray(tr.data, dtype=np.float64)
 
@@ -356,8 +368,19 @@ def main() -> int:
                    metavar=("F1", "F2", "F3", "F4"),
                    help="remove_response pre_filt corners (Hz).")
     p.add_argument("--maxlag", type=float, default=MAXLAG)
+    p.add_argument("--input-root-override", action="append", default=[],
+                   metavar="STATION=PATH",
+                   help="Override DATA_ROOT for a specific station, e.g. "
+                        "--input-root-override HYS14=/data/wsd02/maleen_data/OOI-Data-corrected. "
+                        "Repeatable.")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
+
+    for override in args.input_root_override:
+        if "=" not in override:
+            raise SystemExit(f"--input-root-override must be STATION=PATH, got {override!r}")
+        sta, path = override.split("=", 1)
+        DATA_ROOT_OVERRIDES[sta.strip()] = Path(path.strip())
 
     HP_FREQ = args.hp_freq
     PRE_FILT = tuple(args.pre_filt)

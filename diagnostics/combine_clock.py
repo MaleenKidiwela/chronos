@@ -1,29 +1,30 @@
 #!/usr/bin/env python
-"""Combine the two pair-shift estimates into a single HYS14 clock-error series.
+"""Build the canonical daily HYS14 clock-error estimate.
 
-For each day:
+HYS12-HYS14 (highband) is the **primary** source of Δt_HYS14: stations are
+near-co-located, the daily reference is high-SNR (RMS ~12.8), and coverage
+is good (1331/1582 days). HYS14-HYSB1_lowband is used **only as a
+cross-check** — it has lower SNR and a long deployment-gap stretch — so it
+should not contaminate the primary estimate via averaging.
+
+Sign convention (HYS14 is shared between the two pairs):
     dt_from_HYS12_HYS14 = -shifts_HYS12_HYS14    (HYS14 is the B-side)
     dt_from_HYS14_HYSB1 = +shifts_HYS14_HYSB1    (HYS14 is the A-side)
 
-These two are independent estimates of the same quantity Δt_HYS14, the
-HYS14 clock error (positive = HYS14 reports times that are "late"
-relative to true UTC; the fix subtracts Δt from HYS14's timestamps).
-
-Combine: mean where both pairs are valid, the single valid value where
-only one pair has data, NaN where neither. The disagreement between the
-two pair estimates (where both are valid) is the empirical error bar.
+Δt_HYS14 > 0 means HYS14 reports times that are "late" relative to true
+UTC; the correction subtracts Δt from HYS14's timestamps.
 
 Inputs (from `realign_ccf.py`):
     data/ccf_realigned/HYS12-HYS14/shifts.npy + cc_dates.npy
     data/ccf_realigned/HYS14-HYSB1_lowband/shifts.npy + cc_dates.npy
 
 Outputs (under data/clock_estimate/HYS14/):
-    delta_t.npy              combined HYS14 clock error per day, seconds
+    delta_t.npy              primary daily Δt_HYS14, seconds, NaN where unknown
     dates.npy                master date axis (datetime64[D])
-    dt_from_HYS12_HYS14.npy  per-day estimate from pair 1 (sign-flipped)
-    dt_from_HYS14_HYSB1.npy  per-day estimate from pair 2
-    residual.npy             pair1 - pair2 where both valid, NaN otherwise
-    plot.png                 4-panel diagnostic
+    dt_from_HYS12_HYS14.npy  per-day estimate from primary pair (sign-flipped)
+    dt_from_HYS14_HYSB1.npy  per-day estimate from cross-check pair (validation only)
+    residual.npy             primary - cross-check where both valid; NaN otherwise
+    plot.png                 3-panel diagnostic
 """
 from __future__ import annotations
 
@@ -69,17 +70,14 @@ def align_on_master(
 
 
 def combine(arr_a: np.ndarray, arr_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    valid_a = ~np.isnan(arr_a)
-    valid_b = ~np.isnan(arr_b)
+    """Primary = pair A only. Pair B is a cross-check, never blended in.
+
+    Returns (delta_t, residual) where delta_t is just arr_a (NaNs preserved)
+    and residual is arr_a - arr_b on days both have valid measurements.
+    """
+    out = arr_a.copy()
+    valid_a, valid_b = ~np.isnan(arr_a), ~np.isnan(arr_b)
     both = valid_a & valid_b
-    only_a = valid_a & ~valid_b
-    only_b = valid_b & ~valid_a
-
-    out = np.full_like(arr_a, np.nan)
-    out[both] = 0.5 * (arr_a[both] + arr_b[both])
-    out[only_a] = arr_a[only_a]
-    out[only_b] = arr_b[only_b]
-
     residual = np.full_like(arr_a, np.nan)
     residual[both] = arr_a[both] - arr_b[both]
     return out, residual
@@ -97,11 +95,11 @@ def run() -> None:
     res_rms = float(np.sqrt(np.nanmean(residual[both] ** 2))) if both.any() else float("nan")
 
     LOG.info(
-        "pair A=%s: %d valid; pair B=%s: %d valid; both: %d; combined: %d",
+        "primary=%s: %d valid; cross-check=%s: %d valid; both: %d; output: %d",
         PAIR_A_TAG, int(valid_a.sum()), PAIR_B_TAG, int(valid_b.sum()),
         int(both.sum()), int((~np.isnan(combined)).sum()),
     )
-    LOG.info("residual RMS (A-B where both valid): %.3f s", res_rms)
+    LOG.info("residual RMS (primary - cross-check where both valid): %.3f s", res_rms)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     np.save(OUT_DIR / "delta_t.npy", combined)
@@ -124,11 +122,11 @@ def _plot(dates, a, b, combined, residual, res_rms):
 
     ax = axes[0]
     va, vb = ~np.isnan(a), ~np.isnan(b)
-    ax.plot(days[va], a[va], ".", ms=2.0, color="C0", label=f"{PAIR_A_TAG} (sign {SIGN_A:+.0f})")
-    ax.plot(days[vb], b[vb], ".", ms=2.0, color="C3", label=f"{PAIR_B_TAG} (sign {SIGN_B:+.0f})")
+    ax.plot(days[va], a[va], ".", ms=2.0, color="C0", label=f"{PAIR_A_TAG} primary")
+    ax.plot(days[vb], b[vb], ".", ms=2.0, color="C3", label=f"{PAIR_B_TAG} cross-check")
     ax.axhline(0, color="k", lw=0.4)
     ax.set_ylabel(r"$\Delta t_{HYS14}$ (s)")
-    ax.set_title("Two independent estimates of HYS14 clock error")
+    ax.set_title("Primary estimate and cross-check (both sign-flipped to HYS14 convention)")
     ax.legend(loc="upper right", fontsize=8, markerscale=2)
 
     ax = axes[1]
@@ -136,15 +134,15 @@ def _plot(dates, a, b, combined, residual, res_rms):
     ax.plot(days[vc], combined[vc], ".", ms=2.0, color="C2")
     ax.axhline(0, color="k", lw=0.4)
     ax.set_ylabel(r"$\Delta t_{HYS14}$ (s)")
-    ax.set_title("Combined estimate (mean where both valid, single where one valid)")
+    ax.set_title(f"Canonical Δt: primary ({PAIR_A_TAG}) only")
 
     ax = axes[2]
     vr = ~np.isnan(residual)
     ax.plot(days[vr], residual[vr], ".", ms=2.0, color="C4")
     ax.axhline(0, color="k", lw=0.4)
-    ax.set_ylabel("A - B (s)")
+    ax.set_ylabel("primary - cross-check (s)")
     ax.set_xlabel("Date")
-    ax.set_title(f"Residual where both pairs valid  (RMS = {res_rms:.3f} s)")
+    ax.set_title(f"Validation residual where both pairs valid  (RMS = {res_rms:.3f} s)")
 
     n = len(dates)
     tick_idx = np.linspace(0, n - 1, min(10, n)).astype(int)
