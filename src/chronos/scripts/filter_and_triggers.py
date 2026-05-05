@@ -44,6 +44,13 @@ import matplotlib.pyplot as plt
 DEFAULT_CHRONOS_ROOT = Path("/home/seismic/chronos")
 SAMPLES_PER_DAY = 24.0  # one Δt sample per hour
 DEFAULT_TRIGGER_THRESHOLD = 1.0  # |Δdt| (s) between consecutive retained points
+# Below this segment slope, replace the segment with its robust median.
+# Above it, replace with a robust linear fit. Picker quantum is 0.125 s,
+# so anything below ~0.05 s/day is indistinguishable from flat in noise.
+DEFAULT_SLOPE_THRESHOLD_PER_DAY = 0.05
+DEFAULT_MIN_SEG_VALID = 5  # skip modeling if fewer valid samples than this
+DEFAULT_SMOOTHER_WINDOW_HOURS = 24   # rolling robust median window
+DEFAULT_SMOOTHER_MA_HOURS = 6        # short MA on top of rolling median
 
 
 # ============================================================
@@ -215,6 +222,128 @@ def compute_trigger_periods(dt_clean, threshold=1.0, samples_per_day=24.0):
     return periods, valid_t, valid_dt, diff_ignore_nans, intervals
 
 
+def model_segments(
+    dt_clean,
+    periods,
+    slope_threshold_per_day=DEFAULT_SLOPE_THRESHOLD_PER_DAY,
+    samples_per_day=SAMPLES_PER_DAY,
+    min_valid=DEFAULT_MIN_SEG_VALID,
+    smoother_window=DEFAULT_SMOOTHER_WINDOW_HOURS,
+    smoother_ma=DEFAULT_SMOOTHER_MA_HOURS,
+):
+    """Replace each inter-trigger segment of Δt with a robust model.
+
+    Segments are defined by the trigger intervals from
+    `compute_trigger_periods`. Inside a trigger interval the output stays
+    NaN (chronfix splits its corrected output at those boundaries). Within
+    each stable inter-trigger segment:
+
+      1. robust slope is estimated by Theil-Sen on the finite samples,
+      2. if |slope| < `slope_threshold_per_day` -> segment replaced by its
+         robust median (a flat segment is most honestly a constant; this
+         also avoids end-effect wobble of the rolling smoother),
+      3. otherwise -> segment replaced by a rolling robust median (window
+         `smoother_window` hours, centered) followed by a short moving
+         average (window `smoother_ma` hours, centered). This is shape-
+         preserving: it removes sub-quantum hour-to-hour jitter without
+         imposing any functional form on the drift, so curved drift
+         segments are tracked instead of approximated by a straight line.
+         Edge gaps from the rolling windows are filled with the segment's
+         end-extrapolated values rather than NaN, so the modeled series
+         is dense within the segment.
+
+    The modeled series has the same picker scale as the raw cleaned
+    series, except sub-quantum hourly jitter is removed -- which is what
+    was destroying CCF coherence after chronfix-resample.
+
+    Returns
+    -------
+    dt_model : np.ndarray (float64)
+        Same shape as dt_clean. NaN inside trigger intervals or segments
+        with too few finite samples; modeled values elsewhere.
+    info : list of dicts
+        Per-segment diagnostics: (lo, hi, n_valid, slope_per_day,
+        mode in {"median","rolling","skipped"}, value).
+    """
+    try:
+        from scipy.stats import theilslopes
+        _have_theil = True
+    except Exception:
+        _have_theil = False
+
+    n = len(dt_clean)
+    out = np.full(n, np.nan, dtype=np.float64)
+
+    # Build the list of inter-trigger segments [lo, hi).
+    boundaries: list[tuple[int, int]] = []
+    cursor = 0
+    if periods is not None and len(periods) > 0:
+        # periods is expected to be sorted by start_index.
+        sorted_periods = periods.sort_values("start_index")
+        for _, row in sorted_periods.iterrows():
+            s = int(row["start_index"])
+            e = int(row["end_index"])
+            if s > cursor:
+                boundaries.append((cursor, s))
+            cursor = e + 1
+    if cursor < n:
+        boundaries.append((cursor, n))
+
+    info: list[dict] = []
+    for lo, hi in boundaries:
+        seg = dt_clean[lo:hi]
+        finite_idx = np.where(np.isfinite(seg))[0]
+        if len(finite_idx) < min_valid:
+            info.append({
+                "lo": lo, "hi": hi, "n_valid": int(len(finite_idx)),
+                "slope_per_day": np.nan, "mode": "skipped", "value": np.nan,
+            })
+            continue
+
+        x = finite_idx.astype(np.float64)
+        y = seg[finite_idx].astype(np.float64)
+        if _have_theil:
+            slope, _intercept, _, _ = theilslopes(y, x)
+        else:
+            slope, _intercept = np.polyfit(x, y, 1)
+        slope_per_day = slope * samples_per_day
+
+        if abs(slope_per_day) < slope_threshold_per_day:
+            value = float(np.nanmedian(seg))
+            out[lo:hi] = value
+            info.append({
+                "lo": lo, "hi": hi, "n_valid": int(len(finite_idx)),
+                "slope_per_day": float(slope_per_day),
+                "mode": "median", "value": value,
+            })
+            continue
+
+        # Rolling robust median + short MA. Operate on the full segment
+        # (NaNs from picker filtering count as missing; pandas rolling
+        # ignores them with min_periods).
+        s_seg = pd.Series(seg)
+        win_med = max(3, int(smoother_window))
+        win_ma = max(1, int(smoother_ma))
+        smoothed = (
+            s_seg.rolling(window=win_med, center=True,
+                          min_periods=max(3, win_med // 4)).median()
+                 .rolling(window=win_ma, center=True,
+                          min_periods=max(1, win_ma // 2)).mean()
+        )
+
+        # Fill any leading/trailing NaN by holding the nearest valid
+        # smoothed value; this keeps the segment dense for chronfix and
+        # avoids end-of-segment dropouts.
+        smoothed = smoothed.ffill().bfill()
+        out[lo:hi] = smoothed.to_numpy(dtype=np.float64)
+        info.append({
+            "lo": lo, "hi": hi, "n_valid": int(len(finite_idx)),
+            "slope_per_day": float(slope_per_day),
+            "mode": "rolling", "value": float(np.nanmedian(seg)),
+        })
+    return out, info
+
+
 def plot_filtered_and_triggers(
     dt_clean, periods, valid_t, diff_ignore_nans,
     threshold=1.0, samples_per_day=24.0, outfile="trigger_plot.png",
@@ -282,6 +411,28 @@ def main():
                         "<chronos-root>/data/clock_estimate/<target>/")
     p.add_argument("--threshold", type=float, default=DEFAULT_TRIGGER_THRESHOLD,
                    help="|Δdt| threshold between consecutive retained hourly samples (s).")
+    p.add_argument("--no-segment-model", action="store_true",
+                   help="Disable per-segment modeling. The cleaned hourly Δt "
+                        "is written verbatim to delta_t_hourly_clean.npy "
+                        "(legacy behavior; not recommended -- the picker "
+                        "quantum injects sub-second jitter that chronfix "
+                        "_resample turns into CCF-coherence damage).")
+    p.add_argument("--slope-threshold-per-day", type=float,
+                   default=DEFAULT_SLOPE_THRESHOLD_PER_DAY,
+                   help="Per-segment slope (s/day) below which a segment is "
+                        "modeled as a constant (robust median). Above it, "
+                        "modeled by a rolling robust smoother (shape-"
+                        "preserving).")
+    p.add_argument("--smoother-window-hours", type=int,
+                   default=DEFAULT_SMOOTHER_WINDOW_HOURS,
+                   help="Rolling robust median window (hours) for the "
+                        "drift-segment smoother. Picks up curvature on "
+                        "timescales longer than this; flattens jitter on "
+                        "shorter timescales.")
+    p.add_argument("--smoother-ma-hours", type=int,
+                   default=DEFAULT_SMOOTHER_MA_HOURS,
+                   help="Short moving-average window (hours) applied on "
+                        "top of the rolling median.")
     args = p.parse_args()
 
     clock_dir = Path(args.clock_dir) if args.clock_dir else (
@@ -292,6 +443,7 @@ def main():
     )
 
     filtered_npy = clock_dir / "delta_t_hourly_clean.npy"
+    raw_filtered_npy = clock_dir / "delta_t_hourly_filtered_raw.npy"
     outlier_mask_npy = clock_dir / "delta_t_hourly_outlier_mask.npy"
     trigger_csv = clock_dir / "trigger_periods.csv"
     plot_file = clock_dir / "filter_and_triggers.png"
@@ -305,12 +457,26 @@ def main():
         dt_clean, threshold=args.threshold, samples_per_day=SAMPLES_PER_DAY,
     )
 
-    np.save(filtered_npy, dt_clean)
+    if args.no_segment_model:
+        dt_for_chronfix = dt_clean
+        seg_info = None
+    else:
+        dt_for_chronfix, seg_info = model_segments(
+            dt_clean, periods,
+            slope_threshold_per_day=args.slope_threshold_per_day,
+            samples_per_day=SAMPLES_PER_DAY,
+            smoother_window=args.smoother_window_hours,
+            smoother_ma=args.smoother_ma_hours,
+        )
+        # Always keep the unmodeled cleaned series for QC.
+        np.save(raw_filtered_npy, dt_clean)
+
+    np.save(filtered_npy, dt_for_chronfix)
     np.save(outlier_mask_npy, final_mask)
     periods.to_csv(trigger_csv, index=False)
 
     plot_filtered_and_triggers(
-        dt_clean, periods, valid_t, diff_ignore_nans,
+        dt_for_chronfix, periods, valid_t, diff_ignore_nans,
         threshold=args.threshold, samples_per_day=SAMPLES_PER_DAY,
         outfile=plot_file,
     )
@@ -344,9 +510,25 @@ def main():
         }).to_string(index=False))
         print()
 
+    if seg_info is not None:
+        n_roll = sum(1 for s in seg_info if s["mode"] == "rolling")
+        n_med = sum(1 for s in seg_info if s["mode"] == "median")
+        n_skip = sum(1 for s in seg_info if s["mode"] == "skipped")
+        print("Segment modeling")
+        print("-" * 16)
+        print(f"Slope threshold: {args.slope_threshold_per_day} s/day")
+        print(f"Smoother window: {args.smoother_window_hours} h median, "
+              f"{args.smoother_ma_hours} h MA")
+        print(f"Segments: {len(seg_info)}  rolling={n_roll}  "
+              f"median={n_med}  skipped={n_skip}")
+        print()
+
     print("Saved outputs (this is the correction file chronfix consumes)")
     print("-" * 60)
-    print(f"Filtered data: {filtered_npy}")
+    print(f"Filtered data: {filtered_npy}  "
+          f"({'segment-modeled' if seg_info is not None else 'raw cleaned'})")
+    if seg_info is not None:
+        print(f"Raw filtered : {raw_filtered_npy}")
     print(f"Outlier mask:  {outlier_mask_npy}")
     print(f"Trigger CSV:   {trigger_csv}")
     print(f"Trigger plot:  {plot_file}")

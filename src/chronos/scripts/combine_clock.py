@@ -26,7 +26,11 @@ Outputs (under data/clock_estimate/<target>/):
     dt_hourly_from_<primary-pair-tag>.npy    sign-flipped primary
     dt_hourly_from_<cross-pair-tag>.npy      sign-flipped cross-check (if any)
     residual_hourly.npy                      primary - cross-check, NaN otherwise
-    plot_hourly.png                          4-panel diagnostic (3 if no cross)
+    plot_hourly.png                          diagnostic (3 panels with cross,
+                                              1 panel otherwise)
+
+Trigger / segment-break detection happens in the next pipeline step
+(`chronos.scripts.filter_and_triggers`), not here.
 """
 from __future__ import annotations
 
@@ -96,25 +100,9 @@ def align_on_master(
     return master, aligned
 
 
-def detect_resyncs(
-    times: np.ndarray, dt: np.ndarray,
-    abs_jump_s: float, rel_jump_factor: float,
-) -> np.ndarray:
-    valid = ~np.isnan(dt)
-    vt, vd = times[valid], dt[valid]
-    diffs = np.diff(vd)
-    if len(diffs) == 0:
-        return np.array([], dtype=times.dtype)
-    ad = np.abs(diffs)
-    ref_grad = float(np.percentile(ad[~np.isnan(ad)], 90))
-    threshold = max(abs_jump_s, rel_jump_factor * ref_grad)
-    return vt[1:][ad >= threshold]
-
-
 def run(
     target: str, primary_pair: str, cross_pair: str | None,
     chronos_root: Path,
-    abs_jump_s: float, rel_jump_factor: float,
     ref_window: int, max_shift: float,
 ) -> None:
     data_root = chronos_root / "data"
@@ -160,10 +148,6 @@ def run(
         residual = None
         res_rms = float("nan")
 
-    breaks = detect_resyncs(master, delta_t, abs_jump_s, rel_jump_factor)
-    LOG.info("detected %d resync events  (abs>=%g s or rel>=%g x p90 |gradient|)",
-             len(breaks), abs_jump_s, rel_jump_factor)
-
     out_dir = data_root / "clock_estimate" / target
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "delta_t_hourly.npy", delta_t)
@@ -172,20 +156,25 @@ def run(
     if cross_pair and b_m is not None:
         np.save(out_dir / f"dt_hourly_from_{cross_pair}.npy", b_m)
         np.save(out_dir / "residual_hourly.npy", residual)
-    np.save(out_dir / "segment_breaks.npy", breaks)
     LOG.info("wrote outputs to %s", out_dir)
 
     _plot(out_dir, target, primary_pair, cross_pair,
-          master, a_m, b_m, delta_t, residual, res_rms, breaks)
+          master, a_m, b_m, delta_t, residual, res_rms)
 
 
 def _plot(out_dir, target, primary_pair, cross_pair,
-          times, a, b, combined, residual, res_rms, breaks):
+          times, a, b, combined, residual, res_rms):
+    """Diagnostic plot for the combine stage.
+
+    Trigger / segment-break detection happens in the next step
+    (filter_and_triggers); we don't draw triggers here, only the raw
+    primary, the canonical Δt, and the cross-check residual (if any).
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    n_panels = 4 if cross_pair else 2
+    n_panels = 3 if cross_pair else 1
     fig, axes = plt.subplots(n_panels, 1, figsize=(11, 3 * n_panels), sharex=True)
     if n_panels == 1:
         axes = [axes]
@@ -193,10 +182,6 @@ def _plot(out_dir, target, primary_pair, cross_pair,
     n = len(times)
     tick_idx = np.linspace(0, n - 1, min(10, n)).astype(int)
     tick_labels = [str(times[i].astype("datetime64[D]")) for i in tick_idx]
-    if len(breaks):
-        break_idx = np.searchsorted(times, breaks)
-    else:
-        break_idx = np.array([], dtype=int)
 
     if cross_pair:
         ax = axes[0]
@@ -220,14 +205,6 @@ def _plot(out_dir, target, primary_pair, cross_pair,
 
     if cross_pair:
         ax = axes[i_main + 1]
-        ax.plot(x[vc], combined[vc], ".", ms=1.0, color="C2")
-        for bi in break_idx:
-            ax.axvline(bi, color="k", lw=0.5, alpha=0.3)
-        ax.axhline(0, color="k", lw=0.4)
-        ax.set_ylabel(rf"$\Delta t_{{{target}}}$ (s)")
-        ax.set_title(f"Canonical Δt with detected resync events ({len(breaks)} breaks)")
-
-        ax = axes[i_main + 2]
         vr = ~np.isnan(residual)
         ax.plot(x[vr], residual[vr], ".", ms=1.5, color="C4")
         ax.axhline(0, color="k", lw=0.4)
@@ -255,9 +232,6 @@ def main() -> int:
     p.add_argument("--cross-pair", default=None,
                    help="Optional cross-check pair tag, e.g. HYS14-HYSB1_lowband.")
     p.add_argument("--chronos-root", default=str(DEFAULT_CHRONOS_ROOT))
-    p.add_argument("--abs-jump", type=float, default=5.0,
-                   help="Absolute hourly Δt jump (s) for resync detection.")
-    p.add_argument("--rel-jump-factor", type=float, default=10.0)
     p.add_argument("--ref-window", type=int, default=24 * 30,
                    help="Trailing valid-hour window for anchor median (default 30 days).")
     p.add_argument("--max-shift", type=float, default=50.0,
@@ -272,7 +246,6 @@ def main() -> int:
     run(
         args.target, args.primary_pair, args.cross_pair,
         Path(args.chronos_root),
-        args.abs_jump, args.rel_jump_factor,
         args.ref_window, args.max_shift,
     )
     return 0

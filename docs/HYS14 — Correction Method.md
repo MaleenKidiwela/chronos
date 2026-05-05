@@ -30,7 +30,7 @@ Two packages:
 - **chronos** — measures Δt(t), the clock error of HYS14 vs UTC, from
   cross-correlations against a reference station with known good timing
   (HYS12).
-- **chronfix** — consumes a cleaned hourly Δt time series and a list of
+- **chronfix** — consumes a segment-modeled hourly Δt time series and a list of
   resync events ("triggers"), and applies the timestamp shift to raw
   HYS14 MiniSEED, splitting the output at each trigger.
 
@@ -164,7 +164,10 @@ One more Hampel pass at a 240-hour window with `σ=6.5` and
 re-flagging the legitimate drift ramp interiors.
 
 For the HYS12-HYS14 record this filter masks **673 outlier hours** out
-of 31,169 valid (2.2 %), leaving 30,496 retained samples.
+of 31,169 valid (2.2 %), leaving 30,496 retained samples. The retained
+series is preserved as `delta_t_hourly_filtered_raw.npy` (used only
+for QC); the file chronfix actually consumes is the segment-modeled
+series produced in Stage 3 below.
 
 ### Trigger detection
 
@@ -181,9 +184,44 @@ If `|Δdt_k| > 1.0 s`, the interval `[t(k−1), t(k)]` is flagged as a
 ordinary slow drift. Touching/overlapping intervals are merged. For the
 HYS12-HYS14 record, **32 trigger periods** are detected.
 
+### Stage 3 — per-segment robust smoothing of Δt
+
+The Hampel-filtered series above is a picker-quantum staircase: the
+0.125 s picker quantum (one sample at fs = 8 Hz) is small relative to
+the drift signal but not relative to one CCF window's coherence budget,
+and chronfix's `_resample` linearly interpolates whatever it sees,
+turning the staircase into sub-second false time-warp. To eliminate
+that, each inter-trigger segment of Δt is replaced with a robust
+smooth model before being written as the file chronfix consumes:
+
+- **Slope test (Theil-Sen).** Robust slope of the segment's finite
+  Δt samples. If `|slope| < 0.05 s/day`, the segment is treated as
+  stable.
+- **Stable segments → robust median.** Replace the entire segment
+  with `nanmedian(seg)`. Constant; no sub-quantum artifacts; no
+  end-effect wobble.
+- **Drift segments → rolling robust median + light moving average.**
+  Centered rolling robust median with a 24-hour window, then a
+  centered 6-hour moving average on top of that. No assumption that
+  the drift is linear, so curved drifts (e.g. the 2022-08→2023-01
+  ramp, the 2023-06→2023-09 ramp) are tracked rather than
+  approximated by a straight line.
+
+Trigger intervals stay NaN; chronfix splits its corrected output at
+those boundaries. Segments with fewer than 5 finite samples are
+skipped (left NaN).
+
+Validated on the HYS12-HYS14 record: per-segment residual = (raw
+cleaned Δt) − (modeled Δt) has median ≈ 0.000 s and MAD ≤ 0.115 s on
+every segment, including the longest ones (126 days / 56.7 s of total
+drift). No detectable timing signal remains in the residuals.
+
 Outputs:
 
-- `data/clock_estimate/HYS14/delta_t_hourly_clean.npy` — filtered Δt
+- `data/clock_estimate/HYS14/delta_t_hourly_clean.npy` — **modeled** Δt
+  (this is the file chronfix consumes)
+- `data/clock_estimate/HYS14/delta_t_hourly_filtered_raw.npy` — raw
+  Hampel-filtered Δt (QC only, not consumed by chronfix)
 - `data/clock_estimate/HYS14/delta_t_hourly_outlier_mask.npy` — boolean mask
 - `data/clock_estimate/HYS14/trigger_periods.csv` — merged trigger intervals
 - `data/clock_estimate/HYS14/filter_and_triggers.png` — 2-panel diagnostic
@@ -196,14 +234,21 @@ Outputs:
 interface used by the correction step:
 
 - **`interp_delta_t(t)`** — linear interpolation of Δt at any UTC time
-  using the cleaned hourly samples. Returns NaN if `t` falls inside any
-  trigger interval (Δt is undefined there).
+  using the segment-modeled hourly samples (see Stage 3 of section 6).
+  Returns NaN if `t` falls inside any trigger interval (Δt is undefined
+  there).
 - **`stable_intervals(t0, t1)`** — UTC ranges between consecutive
   triggers within `[t0, t1]`. The correction processes one stable
   interval at a time and never spans a trigger.
 
 Δt within a stable interval is treated as smoothly drifting between
-hourly samples, which is what the underlying physics produces.
+hourly samples. The hourly samples themselves are no longer the raw
+picker output — they are the segment-modeled rolling-median + MA
+series, so the linear interpolation chronfix performs is interpolating
+between points on a smooth curve rather than between staircase
+quanta. This matters because a 0.125 s picker quantum interpolated
+linearly across one hour produces sub-second false time-warp inside
+each CCF window, which is what the 2026-05-04 fix eliminates.
 
 ---
 
@@ -292,7 +337,7 @@ Reading the outputs at `data/ccf/HYS12-HYS14_corrected/` and
 
 | | Before correction | After correction |
 |---|---|---|
-| Reference CC RMS | 12.8 | **33.1** (≈ 2.6× stronger) |
+| Reference CC RMS | 12.8 | **40.6** (≈ 3.2× stronger) |
 | Reference shape | wave packet smeared across ±5 s | sharp peak at lag 0 |
 | Daily 2D stack | drift bands wandering across lag | tight vertical stripe at lag 0 |
 | Hourly peak-lag time series | clear drift ramps + 23 visible resync resets | flat at 0 across all 4 years |
@@ -304,6 +349,66 @@ in the corrected peak-lag plot are noise-driven picks at low-SNR hours
 (uniformly scattered, no time structure), not residual clock error.
 
 Comparison plot: `data/peak_lag_hourly/HYS12-HYS14_corrected/before_after_ccf.png`.
+
+### Note on the corrected hourly peak-lag scatter
+
+An earlier draft of this doc explained the corrected hourly peak-lag
+scatter as the per-hour "noise floor" being unmasked once the dominant
+clock-drift signal was removed. **That explanation was wrong.** A
+diagnostic pass in 2026-05-04 (see `issue1.md`) showed the corrected
+hourly track had genuinely degraded CCF coherence — the ballistic peak
+amplitude in single-hour CCFs was halved, and the global picker was
+locking onto far noise lobes (±60 s) on a substantial fraction of
+hours, including periods that had been clean monotonic ramps in the
+uncorrected plot.
+
+**Root cause:** the cleaned hourly Δt fed to chronfix was a picker-
+quantum staircase (picker resolution = 0.125 s = 1 sample at 8 Hz, so
+hour-to-hour Δt zigzagged by ±0.5 s on top of the slow drift).
+chronfix's `_resample` linearly interpolated this staircase, injecting
+sub-second false time-warp into every CCF window. Within a 30-min
+window that's enough relative timing jitter to scramble phase
+coherence at 1–3 Hz — the band the ballistic peak lives in.
+
+**Fix (2026-05-04):**
+
+1. Per-segment robust smoothing of Δt at the chronos clock-model stage
+   so chronfix consumes a shape-preserving smooth function instead of
+   the staircase. Implemented in
+   `chronos/scripts/filter_and_triggers.py::model_segments`: rolling
+   robust median (24 h window) + light moving average (6 h) for drift
+   segments; robust segment median for flat segments. Driven by the
+   existing trigger-detection output — no station-specific knobs.
+2. Leading-NaN boundary snap in `chronfix/correct.py::_resample` so
+   float-precision overshoots near the apparent-grid boundaries no
+   longer drop the entire output. Recovered ~7,800 corrected hours
+   that were silently being discarded.
+
+**Validation after the fix** (full-timeline hourly outlier rates):
+
+| | n | \|x\|>5s | \|x\|>20s | \|x\|>40s | med\|x\| |
+|---|---|---|---|---|---|
+| uncorrected | 31,563 | 34.76 % | 12.76 % | 3.55 % | 1.875 s |
+| pre-fix corrected (jittery Δt + boundary bug) | 22,244 | 0.81 % | 0.57 % | 0.30 % | 0.125 s |
+| post-fix, linear per-segment fit | 30,084 | 6.33 % | 0.19 % | 0.08 % | 0.375 s |
+| **post-fix, rolling-median per-segment (deployed)** | **30,084** | **0.30 %** | **0.20 %** | **0.10 %** | **0.125 s** |
+
+A residuals diagnostic on the deployed model (raw cleaned Δt minus
+modeled Δt, per inter-trigger segment) shows median ≈ 0.000 s and
+MAD ≤ 0.115 s on every segment, including the longest and most curved
+drift segments (e.g. 126 days / 56.7 s of drift). There is no
+detectable systematic timing signal left in the residuals — what
+remains is consistent with the picker's quantization noise.
+
+The stacked-product evidence (long-term reference RMS up from 12.8 to
+40.6, daily-stack heatmap collapsed to a tight vertical stripe at
+lag 0) is also stronger than in the pre-fix run, where it had risen
+to 33.1 / 2.6×.
+
+Archived versioned figures and arrays (uncorrected, pre-fix,
+linear-per-segment, rolling-per-segment) live under
+`data/results_archive/` with a per-version README that pins each
+iteration's outlier rates and figures.
 
 ### Validation bug uncovered and fixed
 
@@ -386,11 +491,14 @@ End-to-end runtime on cascadia is roughly:
 
 ## 12. Caveats and limitations
 
-- **Δt is sampled at one value per UTC hour.** Within-hour drift is
-  modelled as the linear interpolation between consecutive hourly
-  samples, which is accurate when drift rates are smooth (typically
-  the case during a stable segment) but cannot resolve sub-hour
-  events.
+- **Δt is sampled at one value per UTC hour and the segment-smoothed
+  model has a 24-hour rolling window.** Within-hour drift is modelled
+  as the linear interpolation between consecutive segment-smoothed
+  hourly samples. This is accurate when drift rates are smooth on
+  multi-hour timescales (the regime the data live in) but cannot
+  resolve sub-hour events. The smoother also has small (~0.1 s)
+  end-effects within ~½ window of each trigger boundary; below the
+  noise floor of CCF-coherence sensitivity, but worth noting.
 - **Trigger localisation is to ~1 hour** because each 30-min CC window
   contributes data spanning ~30 min around the hour bucket center.
   Real resyncs that happen at, say, 14:23 UTC are reported with hour-
