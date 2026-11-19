@@ -142,12 +142,24 @@ lag_pick_uncertainty_from_30min_windows    # cross-check on σ_lag
 leave_one_out_prediction_error_for_nonlinearity   # sub-hour smoothness test
 ```
 
-### Headline numbers (HYS12-HYS14, full record)
+### Headline numbers (HYS12-HYS14, full record — v4, 2026-11-19 re-run)
 
 | component | median | p90 | worst |
 |---|---|---|---|
 | σ_lag (parabolic CCF pick) | 0.002 s | 0.005 s | — |
-| σ_model (raw − smoothed, per-segment robust σ) | 0.077 s | 0.108 s | ≈ 0.170 s (one segment) |
-| **σ_total = √(σ_lag² + σ_model²)** | **0.077 s** | **0.108 s** | — |
+| σ_model (raw − smoothed, per-segment robust σ) | 0.077 s | 0.124 s | ≈ 0.178 s (one segment) |
+| **σ_total = √(σ_lag² + σ_model²)** | **0.077 s** | **0.124 s** | ≈ 0.18 s |
 
-For the worst long curved segment (126 days, 56.7 s of total drift), σ_model ≈ 0.170 s ⇒ relative uncertainty ≈ 0.30 %.
+(v3, before the 2026-11-19 fixes: p90 0.108 s, worst 0.170 s; median unchanged.)
+
+The worst σ_model is a *short* segment (8.5 days, 3.1 s of drift ⇒ ≈ 5.7 % relative),
+not the long curved one. The longest drift segment (126 days, −49.7 s of drift)
+has σ_model ≈ 0.093 s ⇒ relative uncertainty ≈ 0.19 %. (An earlier version of this
+note attributed the 0.17 s worst case to the 126-day / 56.7 s segment; that was wrong.)
+
+Caveats on these numbers:
+- σ_lag is a formal parabolic-fit error and is optimistic: the hourly Δt fed to
+  chronfix is rounded to the 0.125 s sample grid (rounding alone is
+  0.125/√12 ≈ 0.036 s), and the observed hour-to-hour scatter is σ_model.
+- The final stable segment (≈ 356 days from mid-2025) reports σ_model = 0 because
+  every raw pick there is the same grid value; its real floor is ≥ 0.036 s.

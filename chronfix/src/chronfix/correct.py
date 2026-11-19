@@ -70,13 +70,12 @@ def correct_trace(
 
         if method == "shift_only":
             corrected = _shift_only(sub_tr, model)
+            if corrected is not None:
+                out.append(corrected)
         elif method == "resample":
-            corrected = _resample(sub_tr, model)
+            out.extend(_resample(sub_tr, model))
         else:
             raise ValueError(f"unknown method: {method!r}")
-
-        if corrected is not None:
-            out.append(corrected)
 
     return out
 
@@ -97,7 +96,7 @@ def correct_stream(
 
 def _shift_only(tr: Trace, model: ClockModel) -> Trace | None:
     """Subtract Δt at the trace start from starttime; leave data alone."""
-    dt0 = model.interp_delta_t(np.datetime64(tr.stats.starttime.datetime, "s"))
+    dt0 = model.interp_delta_t(np.datetime64(tr.stats.starttime.datetime, "us"))
     if not np.isfinite(dt0):
         return None
     new = tr.copy()
@@ -105,90 +104,96 @@ def _shift_only(tr: Trace, model: ClockModel) -> Trace | None:
     return new
 
 
-def _resample(tr: Trace, model: ClockModel) -> Trace | None:
+def _utc_grid_start(t: UTCDateTime, fs: float) -> UTCDateTime:
+    """First time >= t on the absolute sample grid k / fs (k integer).
+
+    Putting corrected output on the canonical grid means downstream tools
+    that snap to the nearest sample (e.g. ``trim(nearest_sample=True)``)
+    do not add up to half a sample of timing error. Falls back to ``t``
+    when 1/fs is not a whole number of nanoseconds.
+    """
+    period_ns = 1e9 / fs
+    if abs(period_ns - round(period_ns)) > 1e-6:
+        return t
+    period_ns = int(round(period_ns))
+    k = -(-t.ns // period_ns)  # ceil division
+    return UTCDateTime(ns=k * period_ns)
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """[start, stop) index pairs of the True runs in a boolean array."""
+    if not mask.any():
+        return []
+    d = np.diff(np.concatenate([[0], mask.astype(np.int8), [0]]))
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0]))
+
+
+def _resample(tr: Trace, model: ClockModel) -> list[Trace]:
     """Resample the trace onto a regular UTC grid using linear interp.
 
-    For each output sample at true UTC time `t_utc`, look up the input
-    trace at apparent time `t_apparent ≈ t_utc + Δt(t_utc)`. Write the
-    interpolated value at `t_utc` on a regular sample grid.
+    For each output sample at true UTC time `t_utc` (on the absolute
+    k / fs grid), look up the input trace at apparent time
+    `t_apparent ≈ t_utc + Δt(t_utc)`. Output samples where Δt is
+    undefined or the target falls outside the input are dropped, and the
+    output is split into one trace per contiguous valid run.
     """
     fs = float(tr.stats.sampling_rate)
     n_in = tr.stats.npts
     if n_in < 2:
-        return None
+        return []
 
-    # Apparent time axis of the input trace (UTCDateTime relative to its starttime).
     apparent_start = tr.stats.starttime
-    apparent_end = tr.stats.endtime
-    # True UTC bounds of this chunk:
-    dt_start = model.interp_delta_t(np.datetime64(apparent_start.datetime, "s"))
-    dt_end = model.interp_delta_t(np.datetime64(apparent_end.datetime, "s"))
-    if not (np.isfinite(dt_start) and np.isfinite(dt_end)):
-        return None
-    utc_start = apparent_start - float(dt_start)
-    utc_end = apparent_end - float(dt_end)
-    if utc_end <= utc_start:
-        return None
+    app_offsets = np.arange(n_in, dtype=np.float64) / fs
+    app_start_us = np.datetime64(apparent_start.datetime, "us")
 
-    # Output UTC sample grid at the same nominal fs.
-    n_out = int(np.floor((utc_end - utc_start) * fs)) + 1
+    # Δt along the apparent axis, to find the UTC span this chunk maps to.
+    # Every 8th sample is plenty for the span; endpoints always included.
+    probe = np.unique(np.r_[np.arange(0, n_in, 8), n_in - 1])
+    dt_probe = model.interp_delta_t(
+        app_start_us + (app_offsets[probe] * 1e6).astype("timedelta64[us]"))
+    ok = np.isfinite(dt_probe)
+    if not ok.any():
+        return []
+    utc_offsets_probe = app_offsets[probe][ok] - dt_probe[ok]   # rel. apparent_start
+    utc_lo = apparent_start + float(utc_offsets_probe.min())
+    utc_hi = apparent_start + float(utc_offsets_probe.max())
+
+    utc_start = _utc_grid_start(utc_lo, fs)
+    if utc_start > utc_hi:
+        return []
+    n_out = int(np.floor((utc_hi - utc_start) * fs + 1e-6)) + 1
     if n_out < 2:
-        return None
-    t_utc_offsets = np.arange(n_out, dtype=np.float64) / fs  # seconds since utc_start
+        return []
+    t_utc_offsets = np.arange(n_out, dtype=np.float64) / fs  # rel. utc_start
 
-    # Compute Δt at each output sample's UTC time. Vectorized: build datetime64
-    # array of UTC times in seconds.
-    utc_start_dt64 = np.datetime64(utc_start.datetime, "us")
-    utc_query_us = utc_start_dt64 + (t_utc_offsets * 1e6).astype("timedelta64[us]")
-    dt_at_utc = model.interp_delta_t(utc_query_us)
-    if np.isnan(dt_at_utc).any():
-        # Mask: only keep contiguous valid run starting from sample 0.
-        valid_mask = np.isfinite(dt_at_utc)
-        if not valid_mask[0]:
-            return None
-        # Trim to first NaN
-        first_nan = int(np.argmax(~valid_mask)) if (~valid_mask).any() else len(valid_mask)
-        if first_nan < 2:
-            return None
-        n_out = first_nan
-        t_utc_offsets = t_utc_offsets[:n_out]
-        dt_at_utc = dt_at_utc[:n_out]
+    utc_start_us = np.datetime64(utc_start.datetime, "us")
+    dt_at_utc = model.interp_delta_t(
+        utc_start_us + (t_utc_offsets * 1e6).astype("timedelta64[us]"))
 
-    # Apparent-time targets at each output sample.
-    apparent_targets_offsets = t_utc_offsets + dt_at_utc + (utc_start - apparent_start)
-    # ^ offsets relative to apparent_start
+    # Apparent-time targets, relative to apparent_start.
+    targets = t_utc_offsets + dt_at_utc + float(utc_start - apparent_start)
 
-    # Input data on apparent-time grid relative to apparent_start.
-    apparent_grid = np.arange(n_in, dtype=np.float64) / fs
-
-    # Snap near-boundary float-precision overshoots back onto the grid;
-    # without this, the very first output sample can land a few ULP below
-    # apparent_grid[0] and np.interp returns NaN, triggering the
-    # trailing-NaN truncation below to drop the entire output.
+    # Snap float-precision overshoots at the input boundaries back onto the
+    # input range so the first/last output samples are not lost.
     eps = 0.5 / fs
-    near_left  = ((apparent_targets_offsets < apparent_grid[0]) &
-                  (apparent_targets_offsets > apparent_grid[0] - eps))
-    near_right = ((apparent_targets_offsets > apparent_grid[-1]) &
-                  (apparent_targets_offsets < apparent_grid[-1] + eps))
-    if near_left.any():
-        apparent_targets_offsets[near_left] = apparent_grid[0]
-    if near_right.any():
-        apparent_targets_offsets[near_right] = apparent_grid[-1]
+    last = app_offsets[-1]
+    targets = np.where((targets < 0) & (targets > -eps), 0.0, targets)
+    targets = np.where((targets > last) & (targets < last + eps), last, targets)
 
+    valid = np.isfinite(targets) & (targets >= 0) & (targets <= last)
     data_in = np.asarray(tr.data, dtype=np.float64)
-    data_out = np.interp(apparent_targets_offsets, apparent_grid, data_in,
-                         left=np.nan, right=np.nan)
+    is_int = np.issubdtype(tr.data.dtype, np.integer)
 
-    # Drop trailing NaNs (target fell off the input range).
-    valid_out = np.isfinite(data_out)
-    if not valid_out.all():
-        last = int(np.argmax(~valid_out)) if (~valid_out).any() else len(valid_out)
-        if last < 2:
-            return None
-        data_out = data_out[:last]
-
-    new = Trace(data=data_out.astype(tr.data.dtype, copy=False))
-    new.stats = tr.stats.copy()
-    new.stats.starttime = utc_start
-    new.stats.npts = len(data_out)
-    return new
+    out: list[Trace] = []
+    for a, b in _runs(valid):
+        if b - a < 2:
+            continue
+        vals = np.interp(targets[a:b], app_offsets, data_in)
+        if is_int:
+            vals = np.rint(vals)
+        new = Trace(data=vals.astype(tr.data.dtype, copy=False))
+        new.stats = tr.stats.copy()
+        new.stats.starttime = utc_start + a / fs
+        new.stats.npts = b - a
+        out.append(new)
+    return out

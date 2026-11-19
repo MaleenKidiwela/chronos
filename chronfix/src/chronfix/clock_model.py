@@ -3,7 +3,9 @@
 Loads the cleaned hourly Δt and trigger intervals produced by
 `filter_and_triggers.py` and exposes:
 
-- `interp_delta_t(t)` — linear interpolation of Δt at any UTC time.
+- `interp_delta_t(t)` — linear interpolation of Δt at any UTC time, only
+  between neighbouring finite hourly samples (never across triggers or
+  long NaN gaps).
 - `is_in_trigger(t)` — True if `t` falls within a trigger interval.
 - `stable_intervals(t0, t1)` — UTC ranges between triggers within [t0, t1].
 
@@ -20,6 +22,21 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_CHRONOS_ROOT = Path("/home/seismic/chronos/data/clock_estimate/HYS14")
+
+
+# Interpolate Δt only between finite hourly samples at most this far apart.
+MAX_INTERP_GAP_HOURS = 3.0
+# Beyond the end of a finite run, hold the edge value for at most this long.
+EDGE_HOLD_HOURS = 1.0
+
+
+def _to_dt64_us(t) -> np.datetime64:
+    """Like _to_dt64 but keeps microsecond precision."""
+    if isinstance(t, np.datetime64):
+        return t.astype("datetime64[us]")
+    if hasattr(t, "datetime"):  # ObsPy UTCDateTime
+        return np.datetime64(t.datetime, "us")
+    return np.datetime64(t, "us")
 
 
 def _to_dt64(t) -> np.datetime64:
@@ -102,35 +119,75 @@ class ClockModel:
             return False
         return bool(self.trigger_starts[idx] <= ts <= self.trigger_ends[idx])
 
-    def interp_delta_t(self, t) -> float | np.ndarray:
-        """Linear interp of Δt at UTC time(s). NaN inside triggers / out-of-range."""
+    def interp_delta_t(
+        self,
+        t,
+        max_gap_hours: float = MAX_INTERP_GAP_HOURS,
+        edge_hold_hours: float = EDGE_HOLD_HOURS,
+    ) -> float | np.ndarray:
+        """Δt at UTC time(s), or NaN where the model does not define it.
+
+        - Between two finite hourly samples that are at most
+          ``max_gap_hours`` apart and in the same inter-trigger segment:
+          linear interpolation.
+        - Otherwise, within ``edge_hold_hours`` of a finite sample (the edge
+          of a finite run, e.g. next to a trigger or a NaN gap): that
+          sample's value is held.
+        - Everything else is NaN: inside trigger intervals, across trigger
+          intervals, and across NaN gaps longer than ``max_gap_hours``
+          (e.g. a segment the clock model left undefined). Earlier versions
+          interpolated across such gaps from samples days away, inventing a
+          Δt where none was measured.
+        """
         scalar = not isinstance(t, np.ndarray)
         if scalar:
-            ts = np.array([_to_dt64(t)], dtype="datetime64[s]")
+            ts = np.array([_to_dt64_us(t)], dtype="datetime64[us]")
         else:
-            ts = t.astype("datetime64[s]", copy=False)
+            ts = t.astype("datetime64[us]", copy=False)
 
-        # Convert the hour-time grid and the query times to seconds-since-epoch
-        # for linear interpolation.
-        h_s = self.hour_times.astype("datetime64[s]").astype(np.int64)
-        q_s = ts.astype(np.int64)
+        # Seconds since epoch (float, µs precision) for hour grid and queries.
+        q = ts.astype(np.int64) / 1e6
+        out = np.full(len(q), np.nan, dtype=np.float64)
 
-        valid = ~np.isnan(self.delta_t)
-        if valid.sum() < 2:
-            out = np.full(len(ts), np.nan, dtype=np.float64)
+        valid = np.isfinite(self.delta_t)
+        if not valid.any():
             return float(out[0]) if scalar else out
+        hv = self.hour_times[valid].astype("datetime64[s]").astype(np.int64).astype(np.float64)
+        dv = self.delta_t[valid]
+        trig_s = self.trigger_starts.astype("datetime64[s]").astype(np.int64).astype(np.float64)
+        trig_e = self.trigger_ends.astype("datetime64[s]").astype(np.int64).astype(np.float64)
+        # Inter-trigger segment id of each finite sample.
+        seg_v = np.searchsorted(trig_s, hv, side="right")
 
-        h_valid = h_s[valid]
-        d_valid = self.delta_t[valid]
-        out = np.interp(q_s, h_valid, d_valid, left=np.nan, right=np.nan)
+        iL = np.searchsorted(hv, q, side="right") - 1   # last finite <= q
+        iR = np.searchsorted(hv, q, side="left")        # first finite >= q
+        hasL = iL >= 0
+        hasR = iR < len(hv)
+        cL = np.clip(iL, 0, len(hv) - 1)
+        cR = np.clip(iR, 0, len(hv) - 1)
+        tL, tR = hv[cL], hv[cR]
+        dL, dR = dv[cL], dv[cR]
+
+        exact = hasL & hasR & (iL == iR)
+        out[exact] = dL[exact]
+
+        gap_ok = (tR - tL) <= max_gap_hours * 3600.0 + 1e-6
+        both = hasL & hasR & ~exact & gap_ok & (seg_v[cL] == seg_v[cR])
+        w = np.zeros_like(q)
+        w[both] = (q[both] - tL[both]) / (tR[both] - tL[both])
+        out[both] = dL[both] + w[both] * (dR[both] - dL[both])
+
+        hold = edge_hold_hours * 3600.0 + 1e-6
+        rem = np.isnan(out)
+        holdL = rem & hasL & ((q - tL) <= hold)
+        out[holdL] = dL[holdL]
+        rem = np.isnan(out)
+        holdR = rem & hasR & ((tR - q) <= hold)
+        out[holdR] = dR[holdR]
 
         # NaN where the query falls inside a trigger interval.
-        if len(self.trigger_starts):
-            ts_starts = self.trigger_starts.astype(np.int64)
-            ts_ends = self.trigger_ends.astype(np.int64)
-            for s, e in zip(ts_starts, ts_ends):
-                in_range = (q_s >= s) & (q_s <= e)
-                out[in_range] = np.nan
+        for s, e in zip(trig_s, trig_e):
+            out[(q >= s) & (q <= e)] = np.nan
 
         return float(out[0]) if scalar else out
 

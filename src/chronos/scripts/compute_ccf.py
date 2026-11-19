@@ -57,6 +57,12 @@ SEG_TAPER_S = 20.0
 CC_LEN = 1800                      # 30-min windows
 CC_STEP = 450                      # 7.5-min step => 75% overlap
 MAXLAG = 60.0                      # seconds
+# Skip a 30-min window unless both stations have real data for at least
+# this fraction of it. Gap samples (zero-filled by merge or padded by the
+# day trim) are not exactly zero after filtering / response removal, and
+# one-bit normalisation turns that residue into random +/-1 noise, which
+# produced spurious low-SNR correlations (and wild peak lags) in gap hours.
+MIN_WINDOW_COVERAGE = 0.5
 
 LOG = logging.getLogger("hys_ccf")
 
@@ -102,7 +108,20 @@ def daily_path(sta: str, d: date) -> Path:
     return root / sta / f"{d.year}" / f"{doy:03d}" / f"{sta}.{NETWORK}.{d.year}.{doy:03d}.{CHANNEL}"
 
 
-def load_day_z(sta: str, d: date, inv) -> np.ndarray | None:
+def _coverage_mask(spans, day_start, fs: float, n: int) -> np.ndarray:
+    """Boolean mask over the canonical day grid: True where a real sample exists."""
+    covered = np.zeros(n, dtype=bool)
+    for t0, t1 in spans:
+        i0 = max(0, int(np.ceil((t0 - day_start) * fs - 1e-6)))
+        i1 = min(n - 1, int(np.floor((t1 - day_start) * fs + 1e-6)))
+        if i1 >= i0:
+            covered[i0:i1 + 1] = True
+    return covered
+
+
+def load_day_z(sta: str, d: date, inv) -> tuple[np.ndarray, np.ndarray] | None:
+    """Preprocessed day trace on the canonical UTC-day grid, plus a mask of
+    samples backed by real data (gaps and padding are zeroed)."""
     path = daily_path(sta, d)
     if not path.exists():
         return None
@@ -114,6 +133,8 @@ def load_day_z(sta: str, d: date, inv) -> np.ndarray | None:
     for tr in st:
         if tr.data.dtype != np.float64:
             tr.data = tr.data.astype(np.float64, copy=False)
+    spans = [(tr.stats.starttime, tr.stats.endtime)
+             for tr in st.select(channel=CHANNEL)]
     try:
         st.merge(method=1, fill_value=0.0)
     except Exception:
@@ -154,7 +175,10 @@ def load_day_z(sta: str, d: date, inv) -> np.ndarray | None:
     tr.trim(starttime=day_start, endtime=day_start + 86400.0,
             pad=True, fill_value=0.0, nearest_sample=True)
 
-    return np.asarray(tr.data, dtype=np.float64)
+    data = np.asarray(tr.data, dtype=np.float64)
+    covered = _coverage_mask(spans, tr.stats.starttime, TARGET_FS, len(data))
+    data[~covered] = 0.0
+    return data, covered
 
 
 # =========================== CC core ===========================
@@ -206,15 +230,23 @@ def cc_segment(a, b, fs, maxlag):
     return np.concatenate([neg, pos])  # length 2*half + 1
 
 
-def process_day(a, b, fs, day_offset_days):
+def process_day(a, b, fs, day_offset_days, cov_a=None, cov_b=None):
     cc_list, t_list = [], []
     seg_n = int(CC_LEN * fs)
     step_n = int(CC_STEP * fs)
     n = min(len(a), len(b))
+    if cov_a is None:
+        cov_a = np.ones(n, dtype=bool)
+    if cov_b is None:
+        cov_b = np.ones(n, dtype=bool)
     i = 0
     while i + seg_n <= n:
         za = a[i: i + seg_n].copy()
         zb = b[i: i + seg_n].copy()
+        if (cov_a[i: i + seg_n].mean() < MIN_WINDOW_COVERAGE
+                or cov_b[i: i + seg_n].mean() < MIN_WINDOW_COVERAGE):
+            i += step_n
+            continue
         if np.std(za) == 0 or np.std(zb) == 0:
             i += step_n
             continue
@@ -260,14 +292,16 @@ def _process_one_day(args):
     pair, d, day_idx = args
     inv_a = _load_inv(pair.sta_a)
     inv_b = _load_inv(pair.sta_b)
-    a = load_day_z(pair.sta_a, d, inv_a)
-    if a is None:
+    ra = load_day_z(pair.sta_a, d, inv_a)
+    if ra is None:
         return d, None, None
-    b = load_day_z(pair.sta_b, d, inv_b)
-    if b is None:
+    rb = load_day_z(pair.sta_b, d, inv_b)
+    if rb is None:
         return d, None, None
+    (a, cov_a), (b, cov_b) = ra, rb
     n = min(len(a), len(b))
-    cc_list, t_list = process_day(a[:n], b[:n], TARGET_FS, day_idx)
+    cc_list, t_list = process_day(a[:n], b[:n], TARGET_FS, day_idx,
+                                  cov_a[:n], cov_b[:n])
     if not cc_list:
         return d, None, None
     return d, np.asarray(cc_list, dtype=np.float32), np.asarray(t_list, dtype=np.float64)

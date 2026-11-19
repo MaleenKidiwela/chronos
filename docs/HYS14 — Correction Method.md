@@ -536,3 +536,65 @@ End-to-end runtime on cascadia is roughly:
 | `data/clock_estimate/HYS14/correction_function.png` | Δt(t) actually applied to timestamps |
 | `/data/wsd02/maleen_data/OOI-Data-corrected/HYS14/` | Corrected MiniSEED, mirroring input layout |
 | `/data/wsd02/maleen_data/OOI-Data-corrected/HYS14/manifest.csv` | Per-output-segment manifest |
+
+---
+
+## 14. 2026-11-19 fixes (v4) and re-validation
+
+A review of the corrected hourly peak-lag scatter found four problems. All are
+fixed and the whole pipeline was re-run (old outputs archived under
+`data/results_archive/v3_pre_fix_20261119/`; new corrected MiniSEED in
+`/data/wsd02/maleen_data/OOI-Data-corrected-v4`).
+
+1. **Stale uncorrected CCFs (start-time mismatch).** The uncorrected HYS12-HYS14
+   CCFs dated from before the canonical-UTC-day trim in `compute_ccf.py`. On the
+   21 days where HYS12 and HYS14 files start at different times (data resuming
+   after an outage), the two traces were aligned by sample index, so the
+   start-time difference was measured as a clock offset (uncorrected lag =
+   −start difference on every such day). Most were rejected as outliers, but on
+   2024-04-10, 2024-08-21 and 2024-12-12 they entered Δt and chronfix applied
+   shifts of 1.1, 7.0 and 2.0 s to data whose clock was fine. Fix: re-run with the
+   current code; Δt on those days is now ≈ 0.
+2. **`ClockModel.interp_delta_t` bridged undefined stretches.** It interpolated
+   over all finite hourly samples, so a segment left NaN (too few samples) got a
+   Δt interpolated from samples days away (2022-11-08: 6.2 s applied where the
+   error was ≈ 62 s). Fix: interpolate only between finite samples ≤ 3 h apart in
+   the same inter-trigger segment; hold edge values ≤ 1 h; NaN otherwise.
+3. **Gap hours in the CCFs.** Zero-filled / padded gaps are not exactly zero after
+   filtering and response removal, and one-bit normalisation turned that residue
+   into random noise, giving low-SNR hourly picks anywhere in ±60 s. 73 % of the
+   remaining "outlier" hours were hours where one station had < 50 % data. Fix:
+   `compute_ccf.py` keeps a real-data mask, zeroes gap samples after processing
+   and skips 30-min windows with < 50 % real data in either station.
+4. **Short coherent clock excursions.** Runs of ≥ 2 outlier-masked hours that agree
+   with each other (range ≤ 1 s) and sit > 1 s off the model (2022-08-21, 4 h at
+   −3.1 s; 2023-08-27, 2 h at −2.5 s) were corrected with the surrounding drift
+   value. Fix: `filter_and_triggers.mark_excursions` marks them as trigger
+   periods, so chronfix drops them.
+
+chronfix also now writes output on the absolute k/fs sample grid (previously
+arbitrary sub-sample start times, which tools that snap to the nearest sample
+shifted by up to ±62 ms), splits output at Δt gaps instead of discarding
+everything after the first one, and rounds (not truncates) integer data.
+
+### Validation, v3 → v4 (corrected HYS14 vs HYS12, hourly global peak lag)
+
+| | v3 | v4 |
+|---|---|---|
+| hours with a pick | 30,084 | 30,857 |
+| \|lag\| > 1 s | 0.43 % | **0.14 %** |
+| \|lag\| > 5 s | 0.30 % | **0.09 %** |
+| high-SNR hours > 1 s off | 39 (4 clusters) | 12 (isolated single hours) |
+| hourly robust σ (sub-sample re-pick) | 71 ms | **58 ms** |
+| daily-stack robust σ | 31 ms | **26 ms** |
+| spread of yearly medians | 27 ms | 25 ms |
+
+Remaining outliers: the first deployment day (2022-08-10/11, low SNR before and
+after correction), two short low-SNR runs in Feb 2024, and 12 isolated hours
+where the picker chose a side lobe (a near-zero peak of similar height is
+present). None show a coherent offset.
+
+Not changed: hourly picks are still nearest-sample (0.125 s); sub-sample picking
+would reduce σ_model and the ~25 ms year-to-year bias. The HYS14-HYSB1 lowband
+cross-check is poor (residual RMS ≈ 18 s, anchor −29.75 s) in both v3 and v4 and
+needs separate investigation.

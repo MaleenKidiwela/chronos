@@ -281,10 +281,23 @@ def run(pair: str, target: str) -> None:
     modeled = np.load(clock_dir / "delta_t_hourly_clean.npy")
     trig_csv = clock_dir / "trigger_periods.csv"
 
-    n_hours = hour_times.size
-    assert cc_hourly.shape[0] == n_hours == raw.size == modeled.size, (
-        "input arrays disagree on hour count"
+    # The clock model lives on combine_clock's master hour axis (the union of
+    # all pairs' hours), which can be longer than this pair's peak-lag axis.
+    # Put the pair's arrays on the master axis (NaN / zero where missing).
+    master = np.load(clock_dir / "hour_times.npy")
+    assert raw.size == modeled.size == master.size, (
+        "clock-model arrays disagree on hour count"
     )
+    if hour_times.size != master.size or not np.array_equal(hour_times, master):
+        idx = np.searchsorted(master, hour_times)
+        if not (np.all(idx < master.size) and np.array_equal(master[idx], hour_times)):
+            raise ValueError("peak-lag hours are not a subset of the clock-model hours")
+        cc_m = np.zeros((master.size, cc_hourly.shape[1]), dtype=cc_hourly.dtype)
+        pk_m = np.full(master.size, np.nan)
+        cc_m[idx] = cc_hourly
+        pk_m[idx] = peak_lag
+        cc_hourly, peak_lag, hour_times = cc_m, pk_m, master
+    n_hours = hour_times.size
 
     LOG.info("σ_lag: parabolic fit on %d hourly CCs", n_hours)
     sigma_lag = parabolic_peak_uncertainty(cc_hourly, peak_lag, lags)

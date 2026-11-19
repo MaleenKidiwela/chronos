@@ -51,6 +51,15 @@ DEFAULT_SLOPE_THRESHOLD_PER_DAY = 0.05
 DEFAULT_MIN_SEG_VALID = 5  # skip modeling if fewer valid samples than this
 DEFAULT_SMOOTHER_WINDOW_HOURS = 24   # rolling robust median window
 DEFAULT_SMOOTHER_MA_HOURS = 6        # short MA on top of rolling median
+# Short, coherent excursions: runs of >= this many consecutive outlier-masked
+# hours whose raw Δt agree with each other (range <= EXCURSION_MAX_RANGE_S)
+# and sit > EXCURSION_MIN_OFFSET_S from the model are real short clock
+# excursions, not picker noise. The Hampel filter discards them, so the
+# model would "correct" those hours with the surrounding drift value and
+# leave a multi-second error. They are marked undefined instead.
+DEFAULT_EXCURSION_MIN_HOURS = 2
+EXCURSION_MIN_OFFSET_S = 1.0
+EXCURSION_MAX_RANGE_S = 1.0
 
 
 # ============================================================
@@ -220,6 +229,71 @@ def compute_trigger_periods(dt_clean, threshold=1.0, samples_per_day=24.0):
     ])
 
     return periods, valid_t, valid_dt, diff_ignore_nans, intervals
+
+
+def mark_excursions(dt_orig, dt_model, outlier_mask, periods,
+                    min_hours=DEFAULT_EXCURSION_MIN_HOURS,
+                    min_offset=EXCURSION_MIN_OFFSET_S,
+                    max_range=EXCURSION_MAX_RANGE_S,
+                    samples_per_day=SAMPLES_PER_DAY):
+    """Set coherent short excursions to NaN and add them as trigger periods.
+
+    Returns (dt_model_out, periods_out, excursions) where excursions is a
+    list of (start_index, end_index, median_offset_s).
+    """
+    dt_model = np.asarray(dt_model, dtype=float).copy()
+    raw = np.asarray(dt_orig, dtype=float)
+    in_trigger = np.zeros(len(raw), dtype=bool)
+    for a, b in zip(periods.get("start_index", []), periods.get("end_index", [])):
+        in_trigger[int(a):int(b) + 1] = True
+    cand = (outlier_mask & np.isfinite(raw) & np.isfinite(dt_model)
+            & (np.abs(raw - dt_model) > min_offset) & ~in_trigger)
+    idx = np.where(cand)[0]
+    excursions = []
+    if len(idx):
+        for run in np.split(idx, np.where(np.diff(idx) > 1)[0] + 1):
+            if len(run) < min_hours:
+                continue
+            v = raw[run]
+            if np.ptp(v) > max_range:
+                continue
+            excursions.append((int(run[0]), int(run[-1]),
+                               float(np.median(v - dt_model[run]))))
+    if not excursions:
+        return dt_model, periods, excursions
+
+    rows = periods.to_dict("records") if len(periods) else []
+    n = len(dt_model)
+    for a, b, off in excursions:
+        dt_model[a:b + 1] = np.nan
+        # Hourly sample h describes the hour [h, h+1), so the excursion
+        # covers [a, b+1): end the trigger at the next (good) hour.
+        e = min(b + 1, n - 1)
+        rows.append({
+            "start_day": a / samples_per_day,
+            "end_day": e / samples_per_day,
+            "duration_days": (e - a) / samples_per_day,
+            "start_index": a,
+            "end_index": e,
+            "max_abs_jump_in_period": abs(off),
+            "num_triggered_steps_merged": 0,
+        })
+    # Sort and merge overlapping / touching intervals (ClockModel expects
+    # sorted, non-overlapping trigger periods).
+    rows.sort(key=lambda r: r["start_index"])
+    merged = []
+    for r in rows:
+        if merged and r["start_index"] <= merged[-1]["end_index"] + 1:
+            m = merged[-1]
+            m["end_index"] = max(m["end_index"], r["end_index"])
+            m["end_day"] = max(m["end_day"], r["end_day"])
+            m["duration_days"] = m["end_day"] - m["start_day"]
+            m["max_abs_jump_in_period"] = max(m["max_abs_jump_in_period"],
+                                              r["max_abs_jump_in_period"])
+            m["num_triggered_steps_merged"] += r["num_triggered_steps_merged"]
+        else:
+            merged.append(dict(r))
+    return dt_model, pd.DataFrame(merged), excursions
 
 
 def model_segments(
@@ -433,6 +507,10 @@ def main():
                    default=DEFAULT_SMOOTHER_MA_HOURS,
                    help="Short moving-average window (hours) applied on "
                         "top of the rolling median.")
+    p.add_argument("--excursion-min-hours", type=int,
+                   default=DEFAULT_EXCURSION_MIN_HOURS,
+                   help="Min consecutive coherent outlier hours treated as a "
+                        "real short clock excursion (marked undefined).")
     args = p.parse_args()
 
     clock_dir = Path(args.clock_dir) if args.clock_dir else (
@@ -471,6 +549,11 @@ def main():
         # Always keep the unmodeled cleaned series for QC.
         np.save(raw_filtered_npy, dt_clean)
 
+    dt_for_chronfix, periods, excursions = mark_excursions(
+        dt_orig, dt_for_chronfix, final_mask, periods,
+        min_hours=args.excursion_min_hours,
+    )
+
     np.save(filtered_npy, dt_for_chronfix)
     np.save(outlier_mask_npy, final_mask)
     periods.to_csv(trigger_csv, index=False)
@@ -499,6 +582,9 @@ def main():
     print("-" * 15)
     print(f"Threshold: |Δdt| > {args.threshold}")
     print(f"Triggered pair-intervals before merging: {len(raw_intervals)}")
+    print(f"Coherent short excursions marked undefined: {len(excursions)}")
+    for a, b, off in excursions:
+        print(f"    hours {a}-{b} ({b - a + 1} h), offset from model {off:+.2f} s")
     print(f"Shaded periods after merging: {len(periods)}")
     print()
 
